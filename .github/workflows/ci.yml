@@ -1,0 +1,102 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  python:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: tlmn
+          POSTGRES_PASSWORD: tlmn
+          POSTGRES_DB: tlmn
+        ports: ["5432:5432"]
+        options: >-
+          --health-cmd "pg_isready -U tlmn -d tlmn" --health-interval 5s --health-timeout 3s --health-retries 20
+    env:
+      DATABASE_URL: postgresql+asyncpg://tlmn:tlmn@localhost:5432/tlmn
+      TEST_DATABASE_URL: postgresql+asyncpg://tlmn:tlmn@localhost:5432/tlmn_test
+      REQUIRE_DB: "1"  # CI không được bỏ qua test cần DB
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          python-version: "3.12"
+      - run: uv sync --all-packages --locked
+      - name: Lint
+        run: uv run ruff check . && uv run ruff format --check .
+      - name: Type check
+        run: uv run mypy
+      - name: Rule catalog khớp Excel
+        run: uv run python tools/gen_rule_catalog.py --appendix --check
+      - name: Migrations
+        working-directory: backend
+        run: uv run alembic upgrade head
+      - name: Tests
+        run: uv run pytest
+      - name: Rule trace (mọi Excel ID có test hoặc nằm trong danh sách chờ của slice sau)
+        run: uv run python tools/check_rule_trace.py --strict
+
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run build
+
+  e2e:
+    # Dựng nguyên stack production (Caddy + api + PostgreSQL) rồi cho 4 trình duyệt chơi trọn ván.
+    runs-on: ubuntu-latest
+    needs: [python, frontend]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Cấu hình stack thử nghiệm
+        run: |
+          cat > deploy/.env <<'EOF'
+          ENVIRONMENT=staging
+          POSTGRES_PASSWORD=ci-mat-khau-thu-nghiem
+          SITE_ADDRESS=:80
+          ALLOWED_ORIGINS=["http://localhost:8080"]
+          COOKIE_SECURE=false
+          HTTP_PORT=8080
+          HTTPS_PORT=8443
+          EOF
+      - name: Build và chạy stack
+        run: |
+          docker compose -f deploy/docker-compose.yml --env-file deploy/.env up -d --build
+          for i in $(seq 1 60); do curl -fs http://localhost:8080/api/health | grep -q '"db":"ok"' && exit 0; sleep 2; done
+          docker compose -f deploy/docker-compose.yml --env-file deploy/.env logs api; exit 1
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - name: Playwright
+        working-directory: frontend
+        env:
+          E2E_BASE_URL: http://localhost:8080
+        run: |
+          npm ci
+          npx playwright install --with-deps chromium
+          npx playwright test
+      - name: Lưu báo cáo khi lỗi
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: frontend/playwright-report
